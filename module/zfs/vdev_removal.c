@@ -467,7 +467,6 @@ vdev_remove_initiate_sync(void *arg, dmu_tx_t *tx)
 		ASSERT0(vdev_obsolete_counts_are_precise(vd, &are_precise));
 		ASSERT3B(are_precise, ==, B_TRUE);
 	}
-
 	vic->vic_mapping_object = vdev_indirect_mapping_alloc(mos, tx);
 	vd->vdev_indirect_mapping =
 	    vdev_indirect_mapping_open(mos, vic->vic_mapping_object);
@@ -506,6 +505,10 @@ vdev_remove_initiate_sync(void *arg, dmu_tx_t *tx)
 			ASSERT0(zfs_range_tree_space(ms->ms_allocating[t]));
 	}
 
+
+	zfs_dbgmsg("attempting to remove vdev %llu (%px) "
+		"sr_to_copy=%llu", (u_longlong_t)vd->vdev_id, vd,
+		(u_longlong_t)spa->spa_removing_phys.sr_to_copy);
 	/*
 	 * Sync tasks are called before metaslab_sync(), so there should
 	 * be no already-synced metaslabs in the TXG_CLEAN list.
@@ -2229,20 +2232,33 @@ spa_vdev_remove_top_check(vdev_t *vd)
 {
 	spa_t *spa = vd->vdev_spa;
 
+	/*
+	 * This device is already being removed
+	 */
+	if (vd->vdev_removing)
+		return (SET_ERROR(EALREADY));
+
+	if (!spa_feature_is_enabled(spa, SPA_FEATURE_DEVICE_REMOVAL))
+		return (SET_ERROR(ENOTSUP));
+
+	/*
+	 * if no block pointers are allocated on the vdev, just
+	 * allow for removal.
+	 */
+
+	zfs_dbgmsg("stats for vdev %llu (%px): vs_alloc: %llu ",
+		(u_longlong_t)vd->vdev_id, vd,
+		(u_longlong_t)vd->vdev_stat.vs_alloc);
+
+	if (vd->vdev_stat.vs_alloc == 0)
+		return (0);
+
 	if (vd != vd->vdev_top)
 		return (SET_ERROR(ENOTSUP));
 
 	if (!vdev_is_concrete(vd))
 		return (SET_ERROR(ENOTSUP));
 
-	if (!spa_feature_is_enabled(spa, SPA_FEATURE_DEVICE_REMOVAL))
-		return (SET_ERROR(ENOTSUP));
-
-	/*
-	 * This device is already being removed
-	 */
-	if (vd->vdev_removing)
-		return (SET_ERROR(EALREADY));
 
 	metaslab_class_t *mc = vd->vdev_mg->mg_class;
 	metaslab_class_t *normal = spa_normal_class(spa);

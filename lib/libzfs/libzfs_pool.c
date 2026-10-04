@@ -4464,8 +4464,8 @@ zpool_vdev_remove(zpool_handle_t *zhp, const char *path)
 
 	case EINVAL:
 		zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
-		    "invalid config; all top-level vdevs must "
-		    "have the same sector size and not be raidz."));
+		    "invalid config; all top-level vdevs must either be "
+		    "empty or, they must have the same sector size and not be raidz."));
 		(void) zfs_error(hdl, EZFS_INVALCONFIG, errbuf);
 		break;
 
