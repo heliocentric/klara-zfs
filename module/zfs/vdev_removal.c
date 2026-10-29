@@ -2115,6 +2115,122 @@ vdev_remove_make_hole_and_free(vdev_t *vd)
  * Remove a log device.  The config lock is held for the specified TXG.
  */
 static int
+spa_vdev_remove_empty(vdev_t *vd, uint64_t *txg)
+{
+	metaslab_group_t *mg = vd->vdev_mg;
+	spa_t *spa = vd->vdev_spa;
+	int error = 0;
+
+	// ASSERT(vd->vdev_islog);
+	// ASSERT(vd == vd->vdev_top);
+	// ASSERT0P(vd->vdev_log_mg);
+	ASSERT(spa_namespace_held());
+
+	/*
+	 * Stop allocating from this vdev.
+	 */
+	metaslab_group_passivate(mg);
+
+	/*
+	 * Wait for the youngest allocations and frees to sync,
+	 * and then wait for the deferral of those frees to finish.
+	 */
+	spa_vdev_config_exit(spa, NULL,
+	    *txg + TXG_CONCURRENT_STATES + TXG_DEFER_SIZE, 0, FTAG);
+
+	/*
+	 * Cancel any initialize or TRIM which was in progress.
+	 */
+	vdev_initialize_stop_all(vd, VDEV_INITIALIZE_CANCELED);
+	vdev_trim_stop_all(vd, VDEV_TRIM_CANCELED);
+	vdev_autotrim_stop_wait(vd);
+
+	/*
+	 * Evacuate the device.  We don't hold the config lock as
+	 * writer since we need to do I/O but we do keep the
+	 * spa_namespace_lock held.  Once this completes the device
+	 * should no longer have any blocks allocated on it.
+	 */
+	ASSERT(spa_namespace_held());
+	if (vd->vdev_stat.vs_alloc != 0)
+		error = spa_reset_logs(spa);
+
+	*txg = spa_vdev_config_enter(spa);
+
+	if (error != 0) {
+		metaslab_group_activate(mg);
+		ASSERT0P(vd->vdev_log_mg);
+		return (error);
+	}
+
+	/*
+	 * The evacuation succeeded.  Remove any remaining MOS metadata
+	 * associated with this vdev, and wait for these changes to sync.
+	 */
+	vd->vdev_removing = B_TRUE;
+
+	vdev_dirty_leaves(vd, VDD_DTL, *txg);
+	vdev_config_dirty(vd);
+
+	/*
+	 * When the log space map feature is enabled we look at
+	 * the vdev's top_zap to find the on-disk flush data of
+	 * the metaslab we just flushed. Thus, while removing a
+	 * log vdev we make sure to call vdev_metaslab_fini()
+	 * first, which removes all metaslabs of this vdev from
+	 * spa_metaslabs_by_flushed before vdev_remove_empty()
+	 * destroys the top_zap of this log vdev.
+	 *
+	 * This avoids the scenario where we flush a metaslab
+	 * from the log vdev being removed that doesn't have a
+	 * top_zap and end up failing to lookup its on-disk flush
+	 * data.
+	 *
+	 * We don't call metaslab_group_destroy() right away
+	 * though (it will be called in vdev_free() later) as
+	 * during metaslab_sync() of metaslabs from other vdevs
+	 * we may touch the metaslab group of this vdev through
+	 * metaslab_class_histogram_verify()
+	 */
+	vdev_metaslab_fini(vd);
+
+	spa_vdev_config_exit(spa, NULL, *txg, 0, FTAG);
+	*txg = spa_vdev_config_enter(spa);
+
+	sysevent_t *ev = spa_event_create(spa, vd, NULL,
+	    ESC_ZFS_VDEV_REMOVE_DEV);
+	ASSERT(spa_namespace_held());
+	ASSERT(spa_config_held(spa, SCL_ALL, RW_WRITER) == SCL_ALL);
+
+	/* The top ZAP should have been destroyed by vdev_remove_empty. */
+	ASSERT0(vd->vdev_top_zap);
+	/* The leaf ZAP should have been destroyed by vdev_dtl_sync. */
+	ASSERT0(vd->vdev_leaf_zap);
+
+	(void) vdev_label_init(vd, 0, VDEV_LABEL_REMOVE);
+
+	if (list_link_active(&vd->vdev_state_dirty_node))
+		vdev_state_clean(vd);
+	if (list_link_active(&vd->vdev_config_dirty_node))
+		vdev_config_clean(vd);
+
+	ASSERT0(vd->vdev_stat.vs_alloc);
+
+	/*
+	 * Clean up the vdev namespace.
+	 */
+	vdev_remove_make_hole_and_free(vd);
+
+	if (ev != NULL)
+		spa_event_post(ev);
+
+	return (0);
+}
+
+/*
+ * Remove a log device.  The config lock is held for the specified TXG.
+ */
+static int
 spa_vdev_remove_log(vdev_t *vd, uint64_t *txg)
 {
 	metaslab_group_t *mg = vd->vdev_mg;
@@ -2429,13 +2545,17 @@ spa_vdev_remove_top(vdev_t *vd, uint64_t *txg)
 
 	vd->vdev_removing = B_TRUE;
 
-	vdev_dirty_leaves(vd, VDD_DTL, *txg);
-	vdev_config_dirty(vd);
-	dmu_tx_t *tx = dmu_tx_create_assigned(spa->spa_dsl_pool, *txg);
-	dsl_sync_task_nowait(spa->spa_dsl_pool,
-	    vdev_remove_initiate_sync, (void *)(uintptr_t)vd->vdev_id, tx);
-	dmu_tx_commit(tx);
+	if (vd->vdev_stat.vs_alloc == 0) {
+		spa_vdev_remove_empty(vd, txg);
+	} else {
+		vdev_dirty_leaves(vd, VDD_DTL, *txg);
+		vdev_config_dirty(vd);
+		dmu_tx_t *tx = dmu_tx_create_assigned(spa->spa_dsl_pool, *txg);
+		dsl_sync_task_nowait(spa->spa_dsl_pool,
+			vdev_remove_initiate_sync, (void *)(uintptr_t)vd->vdev_id, tx);
+		dmu_tx_commit(tx);
 
+	}
 	return (0);
 }
 
